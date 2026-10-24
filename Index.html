@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#10151d">
+  <link rel="manifest" href="manifest.json">
+  <title>GPS Speed & RPM</title>
+  <style>
+    * { box-sizing: border-box }
+    body {
+      margin: 0; min-height: 100vh; display: grid; place-items: center;
+      background: #10151d; color: #f4f7fb; font: 17px system-ui, sans-serif;
+    }
+    main { width: min(440px, 100%); padding: 24px; text-align: center }
+    h1 { font-size: 23px }
+    #speed { font-size: 76px; font-weight: 750; line-height: 1.1; margin-top: 30px }
+    #unit, #status { color: #aeb9c8 }
+    #rpm { font-size: 28px; margin: 20px }
+    button, select {
+      border: 0; border-radius: 12px; padding: 14px 18px;
+      font: inherit; margin: 6px;
+    }
+    button { background: #54d6a0; color: #092219; font-weight: 700 }
+    button:disabled { opacity: .5 }
+    select { background: #263241; color: white }
+    .note { font-size: 13px; color: #aeb9c8; line-height: 1.5; margin-top: 24px }
+  </style>
+</head>
+<body>
+<main>
+  <h1>GPS Speed & RPM</h1>
+  <div id="speed">0</div>
+  <div id="unit">km/h</div>
+  <div id="rpm">RPM: 0 · Gear: 1</div>
+
+  <label for="units">Units </label>
+  <select id="units">
+    <option value="kmh">km/h</option>
+    <option value="mph">mph</option>
+  </select>
+
+  <p><button id="start">Start GPS & sound</button>
+     <button id="stop" disabled>Stop</button></p>
+  <div id="status">Tap Start, then allow location access.</div>
+  <p class="note">
+    RPM and gears are estimates, not readings from your vehicle.
+    GPS can be inaccurate, and sound is synthetic. Keep the phone mounted
+    and don’t interact with it while driving.
+  </p>
+</main>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  let watchId, audio, osc, gain, lastSpeed = null, lastTime = null;
+  let smoothSpeed = 0, gear = 1, lastShift = 0, lastSound = 0;
+  const gearLimits = [0, 18, 35, 55, 78, 105, 140]; // km/h shift points
+
+  function showSpeed(kmh) {
+    const mph = kmh * 0.621371;
+    const useMph = $("units").value === "mph";
+    $("speed").textContent = (useMph ? mph : kmh).toFixed(0);
+    $("unit").textContent = useMph ? "mph" : "km/h";
+  }
+
+  function rpmFor(kmh, g) {
+    // A simple simulated RPM curve for each gear.
+    return Math.max(800, Math.min(6500, 900 + kmh * (210 / g)));
+  }
+
+  function startTone(rpm) {
+    if (!audio) return;
+    const now = audio.currentTime;
+    if (!osc) {
+      osc = audio.createOscillator();
+      gain = audio.createGain();
+      osc.type = "sawtooth";
+      osc.connect(gain).connect(audio.destination);
+      gain.gain.value = 0;
+      osc.start();
+    }
+    osc.frequency.setTargetAtTime(Math.max(35, rpm / 60), now, 0.08);
+    gain.gain.setTargetAtTime(0.055, now, 0.04);
+  }
+
+  function silence() {
+    if (gain && audio) gain.gain.setTargetAtTime(0, audio.currentTime, 0.04);
+  }
+
+  function downshiftBlip(rpm) {
+    if (!audio || audio.state !== "running") return;
+    const now = audio.currentTime;
+    startTone(rpm);
+    gain.gain.cancelScheduledValues(now);
+    gain.gain.setValueAtTime(0.06, now);
+    gain.gain.setTargetAtTime(0, now + 0.14, 0.06);
+  }
+
+  function onPosition(pos) {
+    const raw = Math.max(0, (pos.coords.speed || 0) * 3.6);
+    const now = pos.timestamp;
+    smoothSpeed = lastSpeed === null ? raw : smoothSpeed * 0.72 + raw * 0.28;
+
+    const accel = lastTime ? (smoothSpeed - lastSpeed) / ((now - lastTime) / 1000) : 0;
+    lastSpeed = smoothSpeed;
+    lastTime = now;
+
+    // Shift up with speed; shift down only after slowing below a gear threshold.
+    while (gear < 6 && smoothSpeed > gearLimits[gear] + 2) {
+      gear++;
+      lastShift = now;
+    }
+    if (gear > 1 && smoothSpeed < gearLimits[gear - 1] - 4) {
+      gear--;
+      lastShift = now;
+      downshiftBlip(rpmFor(smoothSpeed, gear));
+    }
+
+    const rpm = rpmFor(smoothSpeed, gear);
+    $("rpm").textContent = `RPM: ${Math.round(rpm)} · Gear: ${gear}`;
+    showSpeed(smoothSpeed);
+
+    // No continuous sound while coasting or slowing down.
+    if (accel > 0.45 && now - lastShift > 500) {
+      startTone(rpm);
+      lastSound = now;
+    } else if (now - lastSound > 250) {
+      silence();
+    }
+    $("status").textContent = `GPS accuracy: ±${Math.round(pos.coords.accuracy)} m`;
+  }
+
+  $("start").onclick = async () => {
+    if (!("geolocation" in navigator)) {
+      $("status").textContent = "This browser does not support GPS location.";
+      return;
+    }
+    try {
+      audio = new (window.AudioContext || window.webkitAudioContext)();
+      await audio.resume();
+      $("start").disabled = true;
+      $("stop").disabled = false;
+      $("status").textContent = "Waiting for GPS…";
+      watchId = navigator.geolocation.watchPosition(onPosition, err => {
+        $("status").textContent = "GPS error: " + err.message +
+          ". Check location permission and try outdoors.";
+      }, { enableHighAccuracy: true, maximumAge: 500, timeout: 15000 });
+    } catch (e) {
+      $("status").textContent = "Could not start audio: " + e.message;
+    }
+  };
+
+  $("stop").onclick = () => {
+    if (watchId !== undefined) navigator.geolocation.clearWatch(watchId);
+    silence();
+    $("start").disabled = false;
+    $("stop").disabled = true;
+    $("status").textContent = "Stopped.";
+  };
+})();
+</script>
+</body>
+</html>
